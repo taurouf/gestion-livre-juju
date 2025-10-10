@@ -6,11 +6,14 @@ import { useEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { supabase } from "../lib/supabaseClient";
 
+// Ajout de "Bibliothèque" avec desktopOnly
 const NAV = [
   { href: "/", label: "Accueil" },
   { href: "/books", label: "Livres", auth: true },
   { href: "/books/new", label: "Ajouter", auth: true },
+  { href: "/books/library", label: "Bibliothèque", auth: true }, // 👈 nouveau
 ];
+
 
 export default function Header() {
   const [session, setSession] = useState(null);
@@ -28,8 +31,8 @@ export default function Header() {
   // évite d'avoir "Livres" actif sur /books/new
   const isActive = (href) => {
     if (href === "/") return pathname === "/";
-    if (href === "/books") return pathname === "/books";
-    return pathname === href;
+    if (href === "/books") return pathname === "/books"; // match exact
+    return pathname === href; // exact pour les autres (/books/library, /books/new, etc.)
   };
 
   async function handleSignOut() {
@@ -69,6 +72,8 @@ export default function Header() {
             <Link
               key={item.href}
               href={item.href}
+              // si desktopOnly => de toute façon la nav est déjà hidden en mobile (sm:hidden),
+              // mais on laisse visible ici sans classe spéciale
               className={
                 "rounded-full px-3 py-1.5 text-sm transition " +
                 (isActive(item.href)
@@ -117,23 +122,26 @@ export default function Header() {
       {open && (
         <div
           id="mobile-menu"
-          className="sm:hidden border-t border-white/10 bg-[#4E0714]/98 backdrop-blur"
+          className="sm:hidden border-top border-white/10 bg-[#4E0714]/98 backdrop-blur"
         >
           <div className="max-w-6xl mx-auto px-3 py-3 grid gap-2">
-            {NAV.filter((i) => (i.auth ? isAuth : true)).map((item) => (
-              <Link
-                key={item.href}
-                href={item.href}
-                className={
-                  "block w-full rounded-xl px-4 py-3 text-base text-left transition " +
-                  (isActive(item.href)
-                    ? "bg-white text-[#4E0714] shadow"
-                    : "bg-white/10 hover:bg-white/15")
-                }
-              >
-                {item.label}
-              </Link>
-            ))}
+            {NAV
+              .filter((i) => (i.auth ? isAuth : true))
+              .filter((i) => !i.desktopOnly) /* 👈 on masque 'Bibliothèque' en mobile */
+              .map((item) => (
+                <Link
+                  key={item.href}
+                  href={item.href}
+                  className={
+                    "block w-full rounded-xl px-4 py-3 text-base text-left transition " +
+                    (isActive(item.href)
+                      ? "bg-white text-[#4E0714] shadow"
+                      : "bg-white/10 hover:bg-white/15")
+                  }
+                >
+                  {item.label}
+                </Link>
+              ))}
 
             {isAuth && (
               <button
