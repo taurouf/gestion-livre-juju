@@ -1,7 +1,7 @@
 // components/BookForm.js
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
 import IsbnScanner from "./IsbnScanner";
 
@@ -21,12 +21,84 @@ const EMPTY = {
   notes: "",
 };
 
+// -------- helpers image --------
+async function downscaleToJpeg(file, maxW = 1200, maxH = 1200, quality = 0.85) {
+  const url = URL.createObjectURL(file);
+  const img = await new Promise((res, rej) => {
+    const i = new Image();
+    i.onload = () => res(i);
+    i.onerror = rej;
+    i.src = url;
+  });
+  let { width, height } = img;
+  const ratio = Math.min(maxW / width, maxH / height, 1);
+  width = Math.round(width * ratio);
+  height = Math.round(height * ratio);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(img, 0, 0, width, height);
+  const blob = await new Promise((res) => canvas.toBlob(res, "image/jpeg", quality));
+  URL.revokeObjectURL(url);
+  return blob;
+}
+function randomName(ext = "jpg") {
+  return `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+}
+
+/** Convertit un code OpenLibrary (`eng`, `fre`, etc.) en libellé friendly */
+function mapLangCodeToLabel(code) {
+  if (!code) return "";
+  const map = {
+    eng: "English",
+    fre: "Français",
+    fra: "Français",
+    spa: "Español",
+    ita: "Italiano",
+    deu: "Deutsch",
+    ger: "Deutsch",
+    por: "Português",
+    rus: "Русский",
+    jpn: "日本語",
+    zho: "中文",
+  };
+  return map[code.toLowerCase()] || code;
+}
+
+/** Best-effort translation EN/other → FR (silencieux si CORS/échec) */
+async function translateToFr(text) {
+  if (!text || text.length < 3) return text;
+  try {
+    const res = await fetch("https://libretranslate.de/translate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        q: text,
+        source: "auto",
+        target: "fr",
+        format: "text",
+      }),
+    });
+    if (!res.ok) return text;
+    const json = await res.json();
+    return json?.translatedText || text;
+  } catch {
+    return text;
+  }
+}
+
 export default function BookForm({ initialBook = null, onSaved, onCancel }) {
   const [form, setForm] = useState(EMPTY);
   const [saving, setSaving] = useState(false);
   const [autofilling, setAutofilling] = useState(false);
   const [showScanner, setShowScanner] = useState(false);
   const isEdit = !!(initialBook && initialBook.id);
+
+  // upload cover
+  const fileRef = useRef(null);
+  const [uploadingCover, setUploadingCover] = useState(false);
 
   useEffect(() => {
     if (initialBook) {
@@ -99,7 +171,7 @@ export default function BookForm({ initialBook = null, onSaved, onCancel }) {
       }
 
       if (result.error) throw result.error;
-      if (onSaved) onSaved(result.data);
+      onSaved?.(result.data);
       if (!isEdit) setForm(EMPTY);
     } catch (err) {
       alert(err.message || "Erreur lors de l’enregistrement");
@@ -118,20 +190,19 @@ export default function BookForm({ initialBook = null, onSaved, onCancel }) {
     setAutofilling(true);
 
     try {
-      // 1) On interroge notre endpoint serveur qui essaie BnF, Google, OpenLibrary
+      // endpoint serveur qui tente BnF → Google → OpenLibrary
       const r = await fetch(`/api/isbn?isbn=${raw}`, { cache: "no-store" });
 
-      // 2) Si pas trouvé (404) ou souci serveur, on retombe sur OpenLibrary direct (fallback)
       let info = null;
       if (r.ok) {
         info = await r.json();
       } else {
-        // Fallback OpenLibrary direct (ultime secours)
+        // fallback OpenLibrary direct (ultime secours)
         info = await fallbackOpenLibrary(raw);
         if (!info) throw new Error("Livre introuvable sur les sources configurées.");
       }
 
-      // 3) Description → tentative de traduction FR (silencieuse si échec)
+      // Description → tentative de traduction FR (silencieuse si échec)
       let description = info.description || "";
       if (description) {
         try {
@@ -140,13 +211,13 @@ export default function BookForm({ initialBook = null, onSaved, onCancel }) {
         } catch {}
       }
 
-      // 4) Map langue si code (ex: 'eng','fre') → label friendly
+      // Map langue si code court
       let language = info.language || "";
       if (language && language.length <= 3) {
         language = mapLangCodeToLabel(language) || language;
       }
 
-      // 5) ÉCRASE tout ce qui arrive non vide
+      // ÉCRASE tout ce qui arrive non vide
       setForm((prev) => ({
         ...prev,
         isbn: raw.slice(0, 13),
@@ -242,6 +313,44 @@ export default function BookForm({ initialBook = null, onSaved, onCancel }) {
     if (e.key === "Enter") {
       e.preventDefault();
       handleAutoFill();
+    }
+  }
+
+  // -------- upload de couverture (caméra/import) --------
+  async function handlePickCover(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadingCover(true);
+    try {
+      // 1) compresser/redimensionner
+      const blob = await downscaleToJpeg(file, 1200, 1200, 0.85);
+
+      // 2) upload vers Supabase Storage (bucket "covers")
+      const ext = "jpg";
+      const path = `covers/${randomName(ext)}`;
+
+      const { data, error } = await supabase.storage
+        .from("covers")
+        .upload(path, blob, {
+          contentType: "image/jpeg",
+          upsert: false,
+        });
+
+      if (error) throw error;
+
+      // 3) URL publique (si bucket public)
+      const { data: pub, error: pubErr } = supabase.storage.from("covers").getPublicUrl(path);
+      if (pubErr) throw pubErr;
+      const url = pub?.publicUrl;
+      if (!url) throw new Error("Impossible de générer l’URL de la couverture.");
+
+      // 4) on remplit le champ cover_url
+      setField("cover_url", url);
+    } catch (err) {
+      alert(err?.message || "Échec de l’envoi de la couverture");
+    } finally {
+      setUploadingCover(false);
+      if (fileRef.current) fileRef.current.value = "";
     }
   }
 
@@ -357,15 +466,52 @@ export default function BookForm({ initialBook = null, onSaved, onCancel }) {
         </div>
       </div>
 
-      {/* Cover URL */}
+      {/* Couverture : URL + prise de photo / import */}
       <div className="mt-4">
-        <label className="block text-sm text-brand-800 mb-1">Cover URL</label>
-        <input
-          className="w-full ring-1 ring-brand-100 focus:ring-2 focus:ring-brand-600 rounded-xl px-3 py-2"
-          value={form.cover_url || ""}
-          onChange={(e) => setField("cover_url", e.target.value)}
-          placeholder="https://…"
-        />
+        <label className="block text-sm text-brand-800 mb-1">Couverture</label>
+
+        <div className="grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end">
+          {/* Champ URL comme avant */}
+          <div>
+            <input
+              className="w-full ring-1 ring-brand-100 focus:ring-2 focus:ring-brand-600 rounded-xl px-3 py-2"
+              value={form.cover_url || ""}
+              onChange={(e) => setField("cover_url", e.target.value)}
+              placeholder="https://… (URL de l’image)"
+            />
+            {form.cover_url && (
+              <div className="mt-2">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={form.cover_url}
+                  alt="Aperçu couverture"
+                  className="h-40 rounded-lg ring-1 ring-brand-200 object-cover"
+                />
+              </div>
+            )}
+          </div>
+
+          {/* Bouton prendre une photo / importer */}
+          <div className="flex sm:justify-end">
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/*"
+              capture="environment"
+              className="hidden"
+              onChange={handlePickCover}
+            />
+            <button
+              type="button"
+              onClick={() => fileRef.current?.click()}
+              disabled={uploadingCover}
+              className="px-4 py-2 rounded-2xl ring-1 ring-brand-200 bg-white hover:bg-brand-50 text-brand-900 disabled:opacity-60"
+              title="Prendre une photo (mobile) ou importer une image"
+            >
+              {uploadingCover ? "Envoi…" : "📷 Prendre une photo / Importer"}
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* Emplacement / Prix */}
@@ -470,53 +616,11 @@ export default function BookForm({ initialBook = null, onSaved, onCancel }) {
         <IsbnScanner
           onDetected={(isbn) => {
             setField("isbn", isbn);
-            // on écrase tout de suite via l’API
-            setTimeout(() => handleAutoFill(), 0);
+            setTimeout(() => handleAutoFill(), 0); // écrase tout de suite
           }}
           onClose={() => setShowScanner(false)}
         />
       )}
     </form>
   );
-}
-
-/** Convertit un code OpenLibrary (`eng`, `fre`, etc.) en libellé friendly */
-function mapLangCodeToLabel(code) {
-  if (!code) return "";
-  const map = {
-    eng: "English",
-    fre: "Français",
-    fra: "Français",
-    spa: "Español",
-    ita: "Italiano",
-    deu: "Deutsch",
-    ger: "Deutsch",
-    por: "Português",
-    rus: "Русский",
-    jpn: "日本語",
-    zho: "中文",
-  };
-  return map[code.toLowerCase()] || code;
-}
-
-/** Best-effort translation EN/other → FR (silencieux si CORS/échec) */
-async function translateToFr(text) {
-  if (!text || text.length < 3) return text;
-  try {
-    const res = await fetch("https://libretranslate.de/translate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        q: text,
-        source: "auto",
-        target: "fr",
-        format: "text",
-      }),
-    });
-    if (!res.ok) return text;
-    const json = await res.json();
-    return json?.translatedText || text;
-  } catch {
-    return text;
-  }
 }
