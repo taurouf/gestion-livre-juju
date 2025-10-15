@@ -2,188 +2,247 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { BrowserMultiFormatReader } from "@zxing/browser";
 
 export default function IsbnScanner({ onDetected, onClose }) {
   const videoRef = useRef(null);
-  const readerRef = useRef(null);
+  const animRef = useRef(null);
   const [running, setRunning] = useState(false);
-  const [usingNative, setUsingNative] = useState(false);
   const [error, setError] = useState("");
-
-  const stopAll = () => {
-    try {
-      if (readerRef.current) {
-        readerRef.current.reset();
-        readerRef.current = null;
-      }
-      const stream = videoRef.current?.srcObject;
-      if (stream) {
-        stream.getTracks().forEach((t) => t.stop());
-        videoRef.current.srcObject = null;
-      }
-    } catch {}
-    setRunning(false);
-  };
+  const [torchOn, setTorchOn] = useState(false);
+  const [track, setTrack] = useState(null);
 
   useEffect(() => {
-    return () => stopAll();
-  }, []);
+    let stream;
+    let cancelled = false;
 
-  async function startScan() {
-    setError("");
-    setRunning(true);
-
-    // --- 1) API native BarcodeDetector si dispo ---
-    let formats = [];
-    try {
-      if (
-        "BarcodeDetector" in window &&
-        typeof window.BarcodeDetector.getSupportedFormats === "function"
-      ) {
-        formats = await window.BarcodeDetector.getSupportedFormats();
-      }
-    } catch {
-      // on ignore
-    }
-    const supportsEAN13 = formats.includes("ean-13") || formats.includes("ean_13");
-
-    if ("BarcodeDetector" in window && supportsEAN13) {
-      setUsingNative(true);
+    async function start() {
+      setError("");
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "environment" },
+        // Caméra arrière si possible
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: "environment" },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
           audio: false,
         });
+        if (cancelled) return;
         if (!videoRef.current) return;
+
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
 
-        const detector = new window.BarcodeDetector({ formats: ["ean-13"] });
+        const t = stream.getVideoTracks?.()[0];
+        setTrack(t);
 
-        let raf;
-        const loop = async () => {
-          try {
-            const barcodes = await detector.detect(videoRef.current);
-            const isbn = barcodes?.[0]?.rawValue?.replace(/\D/g, "");
-            if (isbn && isIsbnLike(isbn)) {
-              onDetected?.(normalizeIsbn(isbn));
-              stopAll();
-              onClose?.();
-              return;
-            }
-          } catch {
-            /* ignore */
-          }
-          raf = requestAnimationFrame(loop);
-        };
-        loop();
-        return;
+        // torch si dispo
+        try {
+          const caps = t?.getCapabilities?.() || {};
+          if (!caps.torch) setTorchOn(false);
+        } catch {}
+
+        setRunning(true);
       } catch (e) {
-        console.warn("BarcodeDetector failed, fallback to ZXing", e);
-        stopAll();
+        setError(e?.message || "Impossible d'accéder à la caméra.");
       }
     }
+    start();
 
-    // --- 2) Fallback ZXing ---
-    setUsingNative(false);
-    startZxing();
-  }
+    return () => {
+      cancelled = true;
+      setRunning(false);
+      if (animRef.current) cancelAnimationFrame(animRef.current);
+      if (stream) {
+        for (const tr of stream.getTracks()) tr.stop();
+      }
+    };
+  }, []);
 
-  async function startZxing() {
-    try {
-      const reader = new BrowserMultiFormatReader();
-      readerRef.current = reader;
+  // boucle de détection
+  useEffect(() => {
+    if (!running) return;
+    if (!("BarcodeDetector" in window)) {
+      setError(
+        "Votre navigateur ne supporte pas la détection native. Utilisez Chrome/Edge/Android récents."
+      );
+      return;
+    }
 
-      const devices = await BrowserMultiFormatReader.listVideoInputDevices();
-      const backCam =
-        devices.find((d) => /back|rear|trou|arrière/i.test(d.label))?.deviceId ??
-        devices[0]?.deviceId;
+    const detector = new window.BarcodeDetector({
+      formats: ["ean_13", "ean_8", "upc_a", "upc_e"],
+    });
 
-      await reader.decodeFromVideoDevice(
-        backCam || null,
-        videoRef.current,
-        (result, err, controls) => {
-          if (result) {
-            const raw = result.getText();
-            const digits = raw.replace(/\D/g, "");
-            if (isIsbnLike(digits)) {
-              onDetected?.(normalizeIsbn(digits));
-              controls.stop();
-              stopAll();
-              onClose?.();
-            }
-          } else if (err) {
-            // NotFoundException = normal quand rien n'est vu -> on ignore
-            if (err?.name && err.name !== "NotFoundException") {
-              console.warn(err);
-            }
+    const loop = async () => {
+      if (!running || !videoRef.current) return;
+      try {
+        // Délimiter la zone de scan au cadre central pour plus de précision
+        const v = videoRef.current;
+        const vw = v.videoWidth;
+        const vh = v.videoHeight;
+
+        // cadre ~ 70% largeur, ratio 2:1
+        const boxW = Math.round(vw * 0.72);
+        const boxH = Math.round(boxW / 2);
+        const sx = Math.round((vw - boxW) / 2);
+        const sy = Math.round((vh - boxH) / 2);
+
+        // on dessine la frame dans un canvas offscreen pour "croper"
+        const canvas = new OffscreenCanvas(boxW, boxH);
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(v, sx, sy, boxW, boxH, 0, 0, boxW, boxH);
+        const bitmap = canvas.transferToImageBitmap();
+
+        const detections = await detector.detect(bitmap);
+
+        if (detections && detections.length) {
+          // cherche d’abord EAN-13
+          const best =
+            detections.find((d) => d.format === "ean_13") ||
+            detections.find((d) => d.rawValue?.length >= 8) ||
+            detections[0];
+
+          if (best?.rawValue) {
+            const isbn = best.rawValue.replace(/[^\dXx]/g, "");
+            stopAndSend(isbn);
+            return;
           }
         }
-      );
-      setRunning(true);
-    } catch (e) {
-      console.error(e);
-      setError("Impossible d’accéder à la caméra.");
-      setRunning(false);
-    }
+      } catch (e) {
+        // pas de spam d’erreur
+      }
+      animRef.current = requestAnimationFrame(loop);
+    };
+
+    animRef.current = requestAnimationFrame(loop);
+    return () => {
+      if (animRef.current) cancelAnimationFrame(animRef.current);
+    };
+  }, [running]);
+
+  function stopAndSend(code) {
+    setRunning(false);
+    if (animRef.current) cancelAnimationFrame(animRef.current);
+    try {
+      const stream = videoRef.current?.srcObject;
+      stream?.getTracks?.().forEach((t) => t.stop());
+    } catch {}
+    onDetected?.(code);
+    onClose?.();
   }
 
-  function isIsbnLike(d) {
-    return /^\d{13}$/.test(d) && (d.startsWith("978") || d.startsWith("979"));
-  }
-  function normalizeIsbn(d) {
-    return d.slice(0, 13);
+  async function toggleTorch() {
+    if (!track?.applyConstraints) return;
+    try {
+      const caps = track.getCapabilities?.() || {};
+      if (!caps.torch) return;
+      await track.applyConstraints({ advanced: [{ torch: !torchOn }] });
+      setTorchOn((v) => !v);
+    } catch {}
   }
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
-      <div className="bg-white w-full max-w-md rounded-2xl shadow-2xl ring-1 ring-brand-100 overflow-hidden">
-        <div className="p-4 flex items-center justify-between">
-          <h3 className="font-semibold text-brand-900">
-            Scanner ISBN {usingNative ? "(rapide)" : "(compatibilité)"}
-          </h3>
-          <button
-            onClick={() => {
-              stopAll();
-              onClose?.();
-            }}
-            className="px-3 py-1.5 rounded-xl ring-1 ring-brand-200 hover:bg-brand-50 text-brand-900"
-          >
-            Fermer
-          </button>
-        </div>
+    <div className="fixed inset-0 z-[80] bg-black/90 text-white">
+      {/* header */}
+      <div className="absolute left-0 right-0 top-0 p-3 flex items-center justify-between">
+        <div className="text-sm opacity-80">Scanner un code EAN-13</div>
+        <button
+          onClick={onClose}
+          className="rounded-xl px-3 py-2 bg-white/10 hover:bg-white/20"
+        >
+          Fermer
+        </button>
+      </div>
 
-        <div className="px-4 pb-3">
-          <div className="rounded-xl overflow-hidden ring-1 ring-brand-100 bg-black">
-            <video ref={videoRef} className="w-full h-64 object-cover" playsInline muted />
+      {/* vidéo + overlay */}
+      <div className="h-full w-full grid place-items-center px-4">
+        <div className="relative w-full max-w-[520px]">
+          <video
+            ref={videoRef}
+            playsInline
+            muted
+            className="w-full rounded-2xl ring-1 ring-white/20"
+          />
+
+          {/* masque sombre + cadre centré */}
+          <div className="pointer-events-none absolute inset-0">
+            {/* masque */}
+            <div className="absolute inset-0">
+              <div className="mask-layer w-full h-full" />
+            </div>
+
+            {/* cadre */}
+            <div className="absolute inset-0 flex items-center justify-center">
+              <div className="scan-box">
+                {/* ligne rouge animée */}
+                <div className="scan-line" />
+              </div>
+            </div>
           </div>
 
-          {error && <p className="mt-2 text-sm text-rose-700">{error}</p>}
-
-          <div className="mt-3 flex gap-2">
-            {!running ? (
-              <button
-                onClick={startScan}
-                className="flex-1 bg-brand-600 hover:bg-brand-900 text-white rounded-2xl px-4 py-2"
-              >
-                Démarrer
-              </button>
-            ) : (
-              <button
-                onClick={stopAll}
-                className="flex-1 bg-rose-600 hover:bg-rose-700 text-white rounded-2xl px-4 py-2"
-              >
-                Arrêter
-              </button>
-            )}
+          {/* message */}
+          <div className="absolute -bottom-12 left-0 right-0 text-center text-sm opacity-90">
+            Alignez le code-barres dans le cadre
           </div>
-
-          <p className="mt-2 text-xs text-brand-700">
-            Astuce : cadre le code-barres EAN-13 (978/979). Lumière suffisante = scan plus rapide.
-          </p>
         </div>
       </div>
+
+      {/* actions bas */}
+      <div className="absolute left-0 right-0 bottom-0 p-4 flex items-center justify-center gap-3">
+        <button
+          onClick={toggleTorch}
+          className="rounded-xl px-4 py-2 bg-white/10 hover:bg-white/20"
+        >
+          {torchOn ? "Éteindre lampe" : "Allumer lampe"}
+        </button>
+        {error && <div className="text-red-300 text-sm">{error}</div>}
+      </div>
+
+      {/* styles inline */}
+      <style jsx>{`
+        .mask-layer {
+          --box-w: min(72vw, 480px);
+          --box-h: calc(var(--box-w) / 2);
+          --line: 3px;
+
+          /* on fait 4 rectangles autour du cadre pour assombrir */
+          background:
+            linear-gradient(#000000b3, #000000b3) top / 100% calc((100% - var(--box-h)) / 2),
+            linear-gradient(#000000b3, #000000b3) bottom / 100% calc((100% - var(--box-h)) / 2),
+            linear-gradient(#000000b3, #000000b3) left / calc((100% - var(--box-w)) / 2) var(--box-h),
+            linear-gradient(#000000b3, #000000b3) right / calc((100% - var(--box-w)) / 2) var(--box-h);
+          background-repeat: no-repeat;
+        }
+        .scan-box {
+          width: var(--box-w);
+          height: var(--box-h);
+          border-radius: 12px;
+          outline: 2px dashed rgba(255, 255, 255, 0.8);
+          outline-offset: -6px;
+          position: relative;
+          overflow: hidden;
+          box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0); /* clics passifs */
+        }
+        .scan-line {
+          position: absolute;
+          left: 10px;
+          right: 10px;
+          height: var(--line);
+          background: linear-gradient(90deg, transparent, #ff2845, transparent);
+          top: 12px;
+          border-radius: 999px;
+          animation: sweep 1.6s linear infinite;
+          box-shadow: 0 0 8px #ff2845, 0 0 2px #ff2845 inset;
+        }
+        @keyframes sweep {
+          0% {
+            top: 12px;
+          }
+          100% {
+            top: calc(100% - 12px);
+          }
+        }
+      `}</style>
     </div>
   );
 }

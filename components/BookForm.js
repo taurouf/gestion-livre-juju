@@ -109,61 +109,104 @@ export default function BookForm({ initialBook = null, onSaved, onCancel }) {
   }
 
   // ---------------------------
-  // Auto-fill via OpenLibrary (REMPLACE TOUJOURS LES CHAMPS QUAND L’API FOURNIT UNE VALEUR)
+  // Auto-fill multi-sources (BnF → Google → OpenLibrary via /api/isbn)
+  // ÉCRASE TOUJOURS LES CHAMPS QUAND L’API FOURNIT UNE VALEUR
   // ---------------------------
   async function handleAutoFill() {
     const raw = (form.isbn || "").replace(/\D/g, "");
     if (!raw) return;
     setAutofilling(true);
+
     try {
-      // 1) ISBN endpoint
-      const rBook = await fetch(`https://openlibrary.org/isbn/${raw}.json`);
-      if (!rBook.ok) throw new Error("ISBN introuvable sur OpenLibrary.");
+      // 1) On interroge notre endpoint serveur qui essaie BnF, Google, OpenLibrary
+      const r = await fetch(`/api/isbn?isbn=${raw}`, { cache: "no-store" });
+
+      // 2) Si pas trouvé (404) ou souci serveur, on retombe sur OpenLibrary direct (fallback)
+      let info = null;
+      if (r.ok) {
+        info = await r.json();
+      } else {
+        // Fallback OpenLibrary direct (ultime secours)
+        info = await fallbackOpenLibrary(raw);
+        if (!info) throw new Error("Livre introuvable sur les sources configurées.");
+      }
+
+      // 3) Description → tentative de traduction FR (silencieuse si échec)
+      let description = info.description || "";
+      if (description) {
+        try {
+          const translated = await translateToFr(description);
+          if (translated) description = translated;
+        } catch {}
+      }
+
+      // 4) Map langue si code (ex: 'eng','fre') → label friendly
+      let language = info.language || "";
+      if (language && language.length <= 3) {
+        language = mapLangCodeToLabel(language) || language;
+      }
+
+      // 5) ÉCRASE tout ce qui arrive non vide
+      setForm((prev) => ({
+        ...prev,
+        isbn: raw.slice(0, 13),
+        title: info.title || prev.title,
+        author: info.author || prev.author,
+        publisher: info.publisher || prev.publisher,
+        publication_date: info.publication_date || prev.publication_date,
+        language: language || prev.language,
+        cover_url: info.cover_url || prev.cover_url,
+        description: description || prev.description,
+      }));
+    } catch (e) {
+      alert(e.message || "Échec de la récupération via ISBN.");
+    } finally {
+      setAutofilling(false);
+    }
+  }
+
+  // Fallback OpenLibrary au cas où /api/isbn ne trouve rien
+  async function fallbackOpenLibrary(isbn) {
+    try {
+      const rBook = await fetch(`https://openlibrary.org/isbn/${isbn}.json`);
+      if (!rBook.ok) return null;
       const bookJson = await rBook.json();
 
-      // Title / Authors
       let title = bookJson.title || "";
-      let authorName = "";
+      let author = "";
       if (Array.isArray(bookJson.authors) && bookJson.authors[0]?.key) {
         try {
           const aRes = await fetch(`https://openlibrary.org${bookJson.authors[0].key}.json`);
           if (aRes.ok) {
             const aJson = await aRes.json();
-            authorName = aJson?.name || "";
+            author = aJson?.name || "";
           }
         } catch {}
       }
 
-      // Publisher
       const publisher =
         (Array.isArray(bookJson.publishers) && bookJson.publishers[0]) ||
         bookJson.publisher ||
         "";
 
-      // Publication date
-      const publication_date =
-        bookJson.publish_date ||
-        bookJson.publishDate ||
-        "";
+      const publication_date = bookJson.publish_date || bookJson.publishDate || "";
 
-      // Language (resolve label)
+      // langue brute
       let language = "";
       if (Array.isArray(bookJson.languages) && bookJson.languages[0]?.key) {
-        try {
-          const code = bookJson.languages[0].key.split("/").pop();
-          language = mapLangCodeToLabel(code) || code || "";
-        } catch {}
+        language = bookJson.languages[0].key.split("/").pop();
       }
 
-      // Cover
       let cover_url = "";
       if (bookJson.covers && bookJson.covers[0]) {
         cover_url = `https://covers.openlibrary.org/b/id/${bookJson.covers[0]}-L.jpg`;
       } else if (bookJson.cover && typeof bookJson.cover === "string") {
         cover_url = bookJson.cover;
+      } else {
+        cover_url = `https://covers.openlibrary.org/b/isbn/${isbn}-L.jpg`;
       }
 
-      // Description depuis /works (plus riche)
+      // Description depuis /works
       let description = "";
       if (Array.isArray(bookJson.works) && bookJson.works[0]?.key) {
         try {
@@ -175,34 +218,22 @@ export default function BookForm({ initialBook = null, onSaved, onCancel }) {
                 ? wJson.description
                 : wJson.description?.value || "";
             description = rawDesc || "";
-
-            // Traduction FR best-effort (silencieux si échec)
-            if (description) {
-              try {
-                const translated = await translateToFr(description);
-                if (translated) description = translated;
-              } catch {}
-            }
           }
         } catch {}
       }
 
-      // >>> ICI on ÉCRASE systématiquement quand l’API renvoie une valeur non vide
-      setForm((prev) => ({
-        ...prev,
-        isbn: raw.slice(0, 13),
-        title: title || prev.title,
-        author: authorName || prev.author,
-        publisher: publisher || prev.publisher,
-        publication_date: publication_date || prev.publication_date,
-        language: language || prev.language,
-        cover_url: cover_url || prev.cover_url,
-        description: description || prev.description,
-      }));
-    } catch (e) {
-      alert(e.message || "Échec de la récupération via ISBN.");
-    } finally {
-      setAutofilling(false);
+      return {
+        isbn,
+        title,
+        author,
+        publisher,
+        publication_date,
+        language,
+        cover_url,
+        description,
+      };
+    } catch {
+      return null;
     }
   }
 
@@ -252,7 +283,7 @@ export default function BookForm({ initialBook = null, onSaved, onCancel }) {
             onClick={handleAutoFill}
             disabled={autofilling || !form.isbn}
             className="mt-7 md:mt-6 bg-brand-600 hover:bg-brand-900 text-white rounded-2xl px-4 py-2 disabled:opacity-60"
-            title="Récupérer les infos via OpenLibrary (remplace les champs)"
+            title="Récupère via BnF → Google → OpenLibrary (remplace les champs)"
           >
             {autofilling ? "Récupération…" : "Récupérer via ISBN"}
           </button>
