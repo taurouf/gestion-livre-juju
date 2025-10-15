@@ -1,83 +1,207 @@
 // app/api/isbn/route.js
 import { NextResponse } from "next/server";
+import { XMLParser } from "fast-xml-parser";
 
-// Helper: timeout rapide pour chaque source
-const withTimeout = (p, ms = 5000) =>
+/** Petite aide pour éviter que chaque source prenne trop de temps */
+const withTimeout = (p, ms = 7000) =>
   Promise.race([
     p,
     new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms)),
   ]);
 
+/** Map des codes langue -> libellé */
+function mapLangCodeToLabel(code) {
+  if (!code) return "";
+  const m = {
+    eng: "English",
+    fre: "Français",
+    fra: "Français",
+    spa: "Español",
+    ita: "Italiano",
+    deu: "Deutsch",
+    ger: "Deutsch",
+    por: "Português",
+    rus: "Русский",
+    jpn: "日本語",
+    zho: "中文",
+  };
+  return m[String(code).toLowerCase()] || code;
+}
+
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
-  const isbn = (searchParams.get("isbn") || "").replace(/[^\dXx]/g, "");
-  if (!isbn) return NextResponse.json({ error: "missing isbn" }, { status: 400 });
+  const raw = (searchParams.get("isbn") || "").replace(/[^\dXx]/g, "");
+  if (!raw) return NextResponse.json({ error: "missing isbn" }, { status: 400 });
 
   try {
-    // 1) BnF SRU
-    const bnf = await tryBnf(isbn);
+    // 1) BnF SRU (DC)
+    const bnf = await tryBnf(raw);
     if (bnf) return NextResponse.json({ source: "bnf", ...bnf });
 
-    // 2) Google Books (avec lang FR si possible)
-    const g = await tryGoogle(isbn);
-    if (g) return NextResponse.json({ source: "google", ...g });
+    // 2) Google Books
+    const google = await tryGoogle(raw);
+    if (google) return NextResponse.json({ source: "google", ...google });
 
     // 3) OpenLibrary
-    const ol = await tryOpenLibrary(isbn);
+    const ol = await tryOpenLibrary(raw);
     if (ol) return NextResponse.json({ source: "openlibrary", ...ol });
 
     return NextResponse.json({ error: "not_found" }, { status: 404 });
   } catch (e) {
-    return NextResponse.json({ error: e.message || "failed" }, { status: 500 });
+    return NextResponse.json(
+      { error: e?.message || "failed" },
+      { status: 500 }
+    );
   }
 }
 
-// ---------- Sources ---------- //
+/* ------------------------- BnF (SRU / DC) ------------------------- */
 
 async function tryBnf(isbn) {
-  // SRU (XML)
-  const url = `https://catalogue.bnf.fr/api/SRU?version=1.2&operation=searchRetrieve&query=isbn=${isbn}`;
-  const res = await withTimeout(fetch(url, { cache: "no-store" }), 7000);
-  if (!res.ok) return null;
-  const xml = await res.text();
+  // On tente plusieurs indexes (certains catalogages n'ont que ean/identifier)
+  const queries = [
+    `bib.isbn any "${isbn}"`,
+    `bib.ean any "${isbn}"`,
+    `dc.identifier any "${isbn}"`,
+  ];
 
-  // extraction minimale (titre, auteur, éditeur, date) avec regex simples
-  // NB: pour du costaud, installe xml2js côté serveur et mappe proprement.
-  const get = (re) => (xml.match(re)?.[1] || "").replace(/\s+/g, " ").trim();
+  for (const cql of queries) {
+    const url =
+      "https://catalogue.bnf.fr/api/SRU?" +
+      new URLSearchParams({
+        version: "1.2",
+        operation: "searchRetrieve",
+        recordSchema: "dc", // Dublin Core (facile à mapper)
+        maximumRecords: "1",
+        query: cql,
+      });
 
-  // Les balises varient (dc:title, marc:subfield…); on tente plusieurs patterns
-  const title =
-    get(/<dc:title>([^<]+)<\/dc:title>/i) ||
-    get(/<title>([^<]+)<\/title>/i) ||
-    "";
+    let res;
+    try {
+      res = await withTimeout(fetch(url, { cache: "no-store" }), 8000);
+    } catch {
+      continue;
+    }
+    if (!res.ok) continue;
 
-  const author =
-    get(/<dc:creator>([^<]+)<\/dc:creator>/i) ||
-    get(/<roleTerm[^>]*>auteur<\/roleTerm>[\s\S]*?<namePart>([^<]+)<\/namePart>/i) ||
-    "";
+    const xml = await res.text();
 
-  const publisher =
-    get(/<dc:publisher>([^<]+)<\/dc:publisher>/i) ||
-    get(/<publisher>([^<]+)<\/publisher>/i) ||
-    "";
+    // Parseur robuste (force certains nœuds en tableaux)
+    const parser = new XMLParser({
+      ignoreAttributes: false,
+      attributeNamePrefix: "",
+      textNodeName: "text",
+      trimValues: true,
+      isArray: (name) =>
+        [
+          "srw:record",
+          "dc:title",
+          "dc:creator",
+          "dc:publisher",
+          "dc:date",
+          "dc:language",
+          "dc:description",
+          "dc:identifier",
+        ].includes(name),
+    });
 
-  const publication_date =
-    get(/<dc:date>([^<]+)<\/dc:date>/i) ||
-    get(/<dateIssued>([^<]+)<\/dateIssued>/i) ||
-    "";
+    let json;
+    try {
+      json = parser.parse(xml);
+    } catch {
+      continue;
+    }
 
-  // cover : pas fourni, on laissera OpenLibrary cover fallback dans le form
-  if (!title) return null;
-  return { isbn, title, author, publisher, publication_date };
+    const resp = json?.["srw:searchRetrieveResponse"];
+    const nb = Number(resp?.["srw:numberOfRecords"] || 0);
+    if (!nb) continue;
+
+    const records = resp?.["srw:records"]?.["srw:record"];
+    const record = Array.isArray(records) ? records[0] : records;
+    const dc = record?.["srw:recordData"]?.["oai_dc:dc"];
+    if (!dc) continue;
+
+    // Helpers
+    const pickText = (v) => {
+      if (v == null) return "";
+      if (Array.isArray(v)) {
+        const first = v.find((x) => x?.text || typeof x === "string");
+        return (first?.text ?? first ?? "").toString().trim();
+      }
+      return (v?.text ?? v ?? "").toString().trim();
+    };
+
+    const allTexts = (v) =>
+      (Array.isArray(v) ? v : [v])
+        .map((x) => (x?.text ?? x ?? "").toString().trim())
+        .filter(Boolean);
+
+    const normalizeRole = (s) =>
+      s
+        .replace(/\.\s*(Auteur du texte|Illustrateur|Éditeur|Editeur|Préfacier|Traducteur).*$/i, "")
+        .replace(/\s+\(\d{4}-.*?\)\s*$/i, "")
+        .trim();
+
+    const extractIsbn = (idents) => {
+      for (const id of allTexts(idents)) {
+        // ex: "ISBN 9791026820963" / "EAN 9791026820963" / URL ark
+        const m = id.match(/\b97[89][\d\- ]{10,}\b/);
+        if (m) return m[0].replace(/[^\dXx]/g, "");
+      }
+      return isbn;
+    };
+
+    // Mapping BnF (DC)
+    const titleFull = pickText(dc["dc:title"]); // Titre complet, on ne tronque pas
+    const title = titleFull; // si tu veux, tu peux enlever la "zone de responsabilité" : titleFull.split(" / ")[0]
+
+    const author = normalizeRole(pickText(dc["dc:creator"])) || "";
+    const publisher = pickText(dc["dc:publisher"]) || "";
+    const publication_date = pickText(dc["dc:date"]) || "";
+
+    // langues : la BnF renvoie parfois "fre" ET "français"
+    const langs = allTexts(dc["dc:language"]);
+    const language =
+      langs.find((l) => l.length > 3) || // "français"
+      mapLangCodeToLabel(langs.find((l) => l.length <= 3)) || // "fre" -> "Français"
+      "";
+
+    const description = allTexts(dc["dc:description"]).join("\n").trim();
+
+    const isbnClean = extractIsbn(dc["dc:identifier"]);
+
+    return {
+      isbn: isbnClean || isbn,
+      title,
+      author,
+      publisher,
+      publication_date,
+      language,
+      description,
+      // Pas de cover à la BnF -> laisse Google/OL compléter
+      cover_url: "",
+    };
+  }
+
+  return null;
 }
+
+/* ------------------------- Google Books ------------------------- */
 
 async function tryGoogle(isbn) {
   const key = process.env.GOOGLE_BOOKS_KEY || "";
   const url =
     `https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}&langRestrict=fr&printType=books` +
     (key ? `&key=${key}` : "");
-  const res = await withTimeout(fetch(url, { cache: "no-store" }), 6000);
+
+  let res;
+  try {
+    res = await withTimeout(fetch(url, { cache: "no-store" }), 7000);
+  } catch {
+    return null;
+  }
   if (!res.ok) return null;
+
   const json = await res.json();
   const it = json.items?.[0]?.volumeInfo;
   if (!it) return null;
@@ -94,8 +218,18 @@ async function tryGoogle(isbn) {
   };
 }
 
+/* ------------------------- OpenLibrary ------------------------- */
+
 async function tryOpenLibrary(isbn) {
-  const r = await withTimeout(fetch(`https://openlibrary.org/isbn/${isbn}.json`, { cache: "no-store" }), 6000);
+  let r;
+  try {
+    r = await withTimeout(
+      fetch(`https://openlibrary.org/isbn/${isbn}.json`, { cache: "no-store" }),
+      7000
+    );
+  } catch {
+    return null;
+  }
   if (!r.ok) return null;
   const data = await r.json();
 
@@ -127,7 +261,7 @@ async function tryOpenLibrary(isbn) {
     } catch {}
   }
 
-  // langue brute
+  // langue brute (code)
   let language = "";
   if (Array.isArray(data.languages) && data.languages[0]?.key) {
     language = data.languages[0].key.split("/").pop();
