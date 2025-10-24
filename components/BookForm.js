@@ -95,6 +95,7 @@ export default function BookForm({ initialBook = null, onSaved, onCancel }) {
   const [autofilling, setAutofilling] = useState(false);
   const [showScanner, setShowScanner] = useState(false);
   const [toast, setToast] = useState(null);
+  const isSuccessToast = toast?.type === "success";
   const isEdit = !!(initialBook && initialBook.id);
 
   // upload cover
@@ -117,6 +118,9 @@ export default function BookForm({ initialBook = null, onSaved, onCancel }) {
   useEffect(() => {
     if (!toast) return;
     const timer = setTimeout(() => setToast(null), 3000);
+    try {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch {}
     return () => clearTimeout(timer);
   }, [toast]);
 
@@ -368,16 +372,30 @@ export default function BookForm({ initialBook = null, onSaved, onCancel }) {
   return (
     <form onSubmit={handleSubmit} className="bg-white rounded-2xl shadow-soft p-6 max-w-2xl">
       {toast && (
-        <div
-          className={
-            "mb-4 flex items-center gap-2 rounded-xl px-4 py-2 text-sm ring-1 transition " +
-            (toast.type === "success"
-              ? "bg-emerald-50 text-emerald-900 ring-emerald-200"
-              : "bg-amber-50 text-amber-900 ring-amber-200")
-          }
-        >
-          <span aria-hidden="true">✅</span>
-          <span>{toast.message}</span>
+        <div className="fixed inset-0 z-[120] bg-black/40 backdrop-blur-sm flex items-center justify-center px-4">
+          <div
+            className={
+              "w-full max-w-sm rounded-2xl px-5 py-6 shadow-lg ring-1 text-center text-sm transition " +
+              (isSuccessToast
+                ? "bg-white text-emerald-800 ring-emerald-200"
+                : "bg-white text-amber-900 ring-amber-200")
+            }
+            role="status"
+            aria-live="assertive"
+          >
+            <div
+              className={
+                "mx-auto mb-3 grid h-12 w-12 place-items-center rounded-full text-2xl " +
+                (isSuccessToast
+                  ? "bg-emerald-100 text-emerald-700"
+                  : "bg-amber-100 text-amber-700")
+              }
+            >
+              <span aria-hidden="true">{isSuccessToast ? "✅" : "⚠️"}</span>
+            </div>
+            <p className="font-medium text-base">{toast.message}</p>
+            <p className="mt-1 text-xs text-brand-600">Fermeture automatique dans 3 secondes…</p>
+          </div>
         </div>
       )}
       <h2 className="text-lg font-semibold text-brand-900 mb-4">
