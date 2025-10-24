@@ -94,6 +94,7 @@ export default function BookForm({ initialBook = null, onSaved, onCancel }) {
   const [saving, setSaving] = useState(false);
   const [autofilling, setAutofilling] = useState(false);
   const [showScanner, setShowScanner] = useState(false);
+  const [toast, setToast] = useState(null);
   const isEdit = !!(initialBook && initialBook.id);
 
   // upload cover
@@ -112,6 +113,12 @@ export default function BookForm({ initialBook = null, onSaved, onCancel }) {
       });
     }
   }, [initialBook]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(null), 3000);
+    return () => clearTimeout(timer);
+  }, [toast]);
 
   function setField(k, v) {
     setForm((f) => ({ ...f, [k]: v }));
@@ -172,6 +179,10 @@ export default function BookForm({ initialBook = null, onSaved, onCancel }) {
 
       if (result.error) throw result.error;
       onSaved?.(result.data);
+      setToast({
+        message: isEdit ? "Modifications enregistrées avec succès." : "Livre créé avec succès.",
+        type: "success",
+      });
       if (!isEdit) setForm(EMPTY);
     } catch (err) {
       alert(err.message || "Erreur lors de l’enregistrement");
@@ -356,6 +367,19 @@ export default function BookForm({ initialBook = null, onSaved, onCancel }) {
 
   return (
     <form onSubmit={handleSubmit} className="bg-white rounded-2xl shadow-soft p-6 max-w-2xl">
+      {toast && (
+        <div
+          className={
+            "mb-4 flex items-center gap-2 rounded-xl px-4 py-2 text-sm ring-1 transition " +
+            (toast.type === "success"
+              ? "bg-emerald-50 text-emerald-900 ring-emerald-200"
+              : "bg-amber-50 text-amber-900 ring-amber-200")
+          }
+        >
+          <span aria-hidden="true">✅</span>
+          <span>{toast.message}</span>
+        </div>
+      )}
       <h2 className="text-lg font-semibold text-brand-900 mb-4">
         {isEdit ? "Modifier le livre" : "Ajouter un livre"}
       </h2>

@@ -32,6 +32,7 @@ export default function BookTable({ books = [], loading, onToggleSold }) {
   const [searchTerm, setSearchTerm] = useState("");
   const [showScanner, setShowScanner] = useState(false);
   const [scanResult, setScanResult] = useState(null);
+  const [navigatingId, setNavigatingId] = useState(null);
 
   const normalizedQuery = searchTerm.trim().toLowerCase();
   const normalizedIsbnQuery = normalizeIsbn(normalizedQuery);
@@ -119,6 +120,12 @@ export default function BookTable({ books = [], loading, onToggleSold }) {
           </div>
         )}
       </div>
+      {navigatingId && (
+        <div className="px-4 py-2 border-b border-brand-100 bg-brand-50 text-sm text-brand-900 flex items-center gap-2">
+          <span className="inline-block h-3 w-3 rounded-full border-2 border-brand-300 border-t-brand-600 animate-spin" aria-hidden="true" />
+          <span>Ouverture du livre…</span>
+        </div>
+      )}
       {/* 👇 wrapper scrollable en mobile */}
       <div className="overflow-x-auto md:overflow-x-visible px-4 pb-4">
         <table className="min-w-[900px] md:min-w-full text-sm">
@@ -140,10 +147,14 @@ export default function BookTable({ books = [], loading, onToggleSold }) {
               filteredBooks.map((b) => (
                 <tr
                   key={b.id}
-                  onClick={() => router.push(`/books/${b.id}`)}
+                  onClick={() => {
+                    setNavigatingId(b.id);
+                    router.push(`/books/${b.id}`);
+                  }}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault();
+                      setNavigatingId(b.id);
                       router.push(`/books/${b.id}`);
                     }
                   }}
@@ -202,16 +213,22 @@ export default function BookTable({ books = [], loading, onToggleSold }) {
                   <td className="px-4 py-3 text-right hidden md:table-cell">
                     <div className="flex justify-end gap-2">
                       <Link
-                        href={`/books/${b.id}`}
-                        onClick={(e) => e.stopPropagation()}
+                      href={`/books/${b.id}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setNavigatingId(b.id);
+                      }}
                         className="px-3 py-1.5 rounded-xl ring-1 ring-brand-200 bg-white/80 hover:bg-white text-brand-900 backdrop-blur transition"
                       >
                         Ouvrir
                       </Link>
 
                       <Link
-                        href={`/books/${b.id}/edit`}
-                        onClick={(e) => e.stopPropagation()}
+                      href={`/books/${b.id}/edit`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setNavigatingId(b.id);
+                      }}
                         className="px-3 py-1.5 rounded-xl bg-brand-600 hover:bg-brand-900 text-white transition"
                       >
                         Éditer
