@@ -2,6 +2,7 @@
 import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import IsbnScanner from "./IsbnScanner";
 
 // Miniature couverture
 function CoverCell({ url, title }) {
@@ -24,15 +25,27 @@ const fmtPrice = (val) => {
   return new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR" }).format(n);
 };
 
+const normalizeIsbn = (value) => (value || "").toString().replace(/[^\dXx]/g, "").toLowerCase();
+
 export default function BookTable({ books = [], loading, onToggleSold }) {
   const router = useRouter();
   const [searchTerm, setSearchTerm] = useState("");
+  const [showScanner, setShowScanner] = useState(false);
+  const [scanResult, setScanResult] = useState(null);
 
   const normalizedQuery = searchTerm.trim().toLowerCase();
+  const normalizedIsbnQuery = normalizeIsbn(normalizedQuery);
   const filteredBooks = useMemo(() => {
     if (!normalizedQuery) return books;
-    return books.filter((book) => (book.title || "").toLowerCase().includes(normalizedQuery));
-  }, [books, normalizedQuery]);
+    return books.filter((book) => {
+      const title = (book.title || "").toLowerCase();
+      const isbn = normalizeIsbn(book.isbn);
+      return (
+        (title && title.includes(normalizedQuery)) ||
+        (normalizedIsbnQuery && isbn.includes(normalizedIsbnQuery))
+      );
+    });
+  }, [books, normalizedIsbnQuery, normalizedQuery]);
 
   if (loading) return <div className="text-brand-800">Chargement…</div>;
   if (!books.length) return <div className="text-brand-800">Aucun livre.</div>;
@@ -41,16 +54,70 @@ export default function BookTable({ books = [], loading, onToggleSold }) {
     <div className="rounded-2xl ring-1 ring-brand-100 bg-white">
       <div className="px-4 py-3 border-b border-brand-100">
         <label htmlFor="book-search" className="sr-only">
-          Rechercher un livre par son titre
+          Rechercher un livre par son titre ou ISBN
         </label>
-        <input
-          id="book-search"
-          type="search"
-          value={searchTerm}
-          onChange={(e) => setSearchTerm(e.target.value)}
-          placeholder="Rechercher un livre par titre…"
-          className="w-full md:w-80 px-3 py-2 text-sm rounded-xl border border-brand-200 focus:border-brand-400 focus:ring-2 focus:ring-brand-200/80 focus:outline-none text-brand-900 placeholder-brand-400 transition"
-        />
+        <div className="flex flex-col gap-2 md:flex-row md:items-center md:gap-3">
+          <input
+            id="book-search"
+            type="search"
+            value={searchTerm}
+            onChange={(e) => {
+              const next = e.target.value;
+              setSearchTerm(next);
+              if (scanResult && normalizeIsbn(next) !== scanResult.isbn) {
+                setScanResult(null);
+              }
+            }}
+            placeholder="Rechercher par titre ou ISBN…"
+            className="w-full md:w-72 px-3 py-2 text-sm rounded-xl border border-brand-200 focus:border-brand-400 focus:ring-2 focus:ring-brand-200/80 focus:outline-none text-brand-900 placeholder-brand-400 transition"
+          />
+          <button
+            type="button"
+            onClick={() => setShowScanner(true)}
+            className="inline-flex items-center justify-center gap-1 rounded-xl border border-brand-200 bg-white px-3 py-2 text-sm text-brand-900 hover:bg-brand-50 transition"
+          >
+            <span aria-hidden="true">📷</span>
+            Scanner un ISBN
+          </button>
+        </div>
+        {scanResult && (
+          <div
+            className={
+              "mt-2 text-sm rounded-xl px-3 py-2 " +
+              (scanResult.found
+                ? "bg-emerald-50 text-emerald-900 ring-1 ring-emerald-200"
+                : "bg-amber-50 text-amber-900 ring-1 ring-amber-200")
+            }
+          >
+            {scanResult.found ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <span>
+                  ISBN <strong>{scanResult.isbn}</strong> déjà présent dans la bibliothèque.
+                </span>
+                {scanResult.book?.id && (
+                  <Link
+                    href={`/books/${scanResult.book.id}`}
+                    className="rounded-lg bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-emerald-700 transition"
+                  >
+                    Ouvrir la fiche
+                  </Link>
+                )}
+              </div>
+            ) : (
+              <div className="flex flex-wrap items-center gap-2">
+                <span>
+                  Aucun livre ne possède l’ISBN <strong>{scanResult.isbn}</strong>.
+                </span>
+                <Link
+                  href={`/books/new?isbn=${scanResult.isbn}`}
+                  className="rounded-lg bg-amber-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-amber-700 transition"
+                >
+                  Créer ce livre
+                </Link>
+              </div>
+            )}
+          </div>
+        )}
       </div>
       {/* 👇 wrapper scrollable en mobile */}
       <div className="overflow-x-auto md:overflow-x-visible px-4 pb-4">
@@ -182,6 +249,26 @@ export default function BookTable({ books = [], loading, onToggleSold }) {
         </table>
       </div>
       {/* fin wrapper scrollable */}
+      {showScanner && (
+        <IsbnScanner
+          onDetected={(isbnRaw) => {
+            const isbn = normalizeIsbn(isbnRaw);
+            setShowScanner(false);
+            setSearchTerm(isbn);
+            if (!isbn) {
+              setScanResult(null);
+              return;
+            }
+            const existing = books.find((book) => normalizeIsbn(book.isbn) === isbn);
+            setScanResult(
+              existing
+                ? { isbn, found: true, book: existing }
+                : { isbn, found: false, book: null }
+            );
+          }}
+          onClose={() => setShowScanner(false)}
+        />
+      )}
     </div>
   );
 }
